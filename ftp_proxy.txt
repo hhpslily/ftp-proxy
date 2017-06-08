@@ -1,0 +1,312 @@
+#include <sys/socket.h>
+#include <sys/types.h>
+#include <sys/wait.h>
+#include <stdio.h>
+#include <string.h>
+#include <stdlib.h>
+#include <netinet/in.h>
+#include <unistd.h>
+#include <errno.h>
+#include <dirent.h>
+#include <arpa/inet.h>
+#include <time.h>
+#include <unistd.h>
+#include <stdbool.h>
+
+#define MagicNumber 8
+#define MAXSIZE 2048
+#define FTP_PORT 8740
+#define FTP_PASV_CODE 227
+#define FTP_ADDR "140.114.71.159"
+#define max(X,Y) ((X) > (Y) ? (X) : (Y))
+
+int proxy_IP[4];
+
+int connect_FTP(int ser_port, int clifd);
+int proxy_func(int ser_port, int clifd, int rate ,bool download);
+int create_server(int port);
+void rate_control(clock_t t, int rate, int size, double magic);
+//argc 與 argv 為C 語言的關鍵字，是專門用在命令列的參數名
+//argc 是argument count(參數總和)的縮寫，代表包括指令本身的參數個數。系統會自動計算所輸入的參數個數。
+//argv 則是argument value 的縮寫。代表參數值。
+//也就是使用者在命令列中輸入的字串，每個字串以空白相隔。
+//同時，系統會自動將程式本身的名稱指定給argv[0] ，再將程式名稱後面所接續的參數依序指定給argv[1] 、argv[2]…. 。
+//argv[1]儲存IP ; argv[2]儲存Port
+int main (int argc, char **argv) {
+    int ctrlfd, connfd, port, rate = 0;
+    //<sys/types.h>pid_t is an integer.
+    pid_t childpid;
+    //<sys/socket.h> socklen_t, which is an unsigned opaque integral type of length of at least 32 bits.
+	//To forestall portability problems, it is recommended that applications should not use values larger than 2^32 - 1. 
+    socklen_t clilen;
+    //<netinet/in.h>sockaddr_in
+	//struct sockaddr_in {
+　　//short int sin_family; /* Address family */指代協議族，在socket編程中只能是AF_INET
+　　//unsigned short int sin_port; /* Port number */存儲端口號（使用網絡字節順序）
+　　//struct in_addr sin_addr; /* Internet address */存儲IP地址，使用in_addr這個數據結構
+　　//unsigned char sin_zero[8]; /* Same size as struct sockaddr */是爲了讓sockaddr與sockaddr_in兩個數據結構保持大小相同而保留的空字節
+　　//};
+	//client address
+    struct sockaddr_in cliaddr;
+    //argv[0]:程式本身的名稱;argv[1]:IP;argv[2]:Port
+	//argument count(參數總和)<3
+    if (argc < 3) {
+        printf("[v] Usage: ./executableFile <ProxyIP> <ProxyPort> \n");
+        return -1;
+    }
+
+    //argv[1]為IP
+	//寫入proxy_IP[0] proxy_IP[1] proxy_IP[2] proxy_IP[3]
+    sscanf(argv[1], " %d.%d.%d.%d", &proxy_IP[0], &proxy_IP[1], &proxy_IP[2], &proxy_IP[3]);
+    //argv[2]為Port的字串
+	//轉成int寫入port
+    port = atoi(argv[2]);
+    rate = atoi(argv[3]);
+
+    ctrlfd = create_server(port);
+    clilen = sizeof(struct sockaddr_in);
+    for (;;) {
+        //ctrlfd:listen()所使用的socket
+		//cliaddr:宣告完就拿來用，存放client 資訊
+		//clilen:sizeof(struct sockaddr_in)
+		//accept()傳回1個file descriptione供connection i/o使用
+        connfd = accept(ctrlfd, (struct sockaddr *)&cliaddr, &clilen);
+        if (connfd < 0) {
+            printf("[x] Accept failed\n");
+            return 0;
+        }
+
+        //sin_addr:Internet address 
+		//sin_port:Port number
+		//使用inet_ntoa(network to ascii)將網址轉換成以"."間隔
+        printf("[v] Client: %s:%d connect!\n", inet_ntoa(cliaddr.sin_addr), htons(cliaddr.sin_port));
+        //fork() returns a positive value, the process ID of the child process, to the parent.
+		//fork() returns a negative value, the creation of a child process was unsuccessful. 
+		//fork() returns a zero to the newly created child process. 
+		//Due to the fact that the CPU scheduler will assign a time quantum to each process,
+		//the parent or the child process will run for some time before the control is switched
+		//to the other and the running process will print some lines before you can see any line printed by the other process.
+		//Therefore, the value of MAX_COUNT should be large enough so that both processes will run for at least two or more time quanta.
+		//If the value of MAX_COUNT is so small that a process can finish in one time quantum, 
+		//you will see two groups of lines, each of which contains all lines printed by the same process.  
+		if ((childpid = fork()) == 0) {
+            close(ctrlfd);
+            proxy_func(FTP_PORT, connfd, rate, false);
+            printf("[v] Client: %s:%d terminated!\n", inet_ntoa(cliaddr.sin_addr), htons(cliaddr.sin_port));
+            exit(0);
+        }
+		// 結束資料傳輸，釋放socket
+        close(connfd);
+    }
+    return 0;
+}
+
+int connect_FTP(int ser_port, int clifd) {
+    int sockfd;
+    char addr[] = FTP_ADDR;
+    int byte_num;
+    char buffer[MAXSIZE];
+    struct sockaddr_in servaddr;
+
+    // 建立socket
+	//socket()由client server使用
+	//成功:回傳socket descriptione
+	//失敗回傳-1
+	//SOCK_STREAM使用TCP協議
+    if ((sockfd = socket(AF_INET, SOCK_STREAM, 0)) < 0) {
+        printf("[x] Create socket error");
+        return -1;
+    }
+
+    bzero(&servaddr, sizeof(servaddr));
+    servaddr.sin_family = AF_INET;
+    servaddr.sin_port = htons(ser_port);
+
+    if (inet_pton(AF_INET, addr, &servaddr.sin_addr) <= 0) {
+        printf("[v] Inet_pton error for %s", addr);
+        return -1;
+    }
+
+    if (connect(sockfd, (struct sockaddr *)&servaddr, sizeof(servaddr)) < 0) {
+        printf("[x] Connect error");
+        return -1;
+    }
+
+    printf("[v] Connect to FTP server\n");
+    if (ser_port == FTP_PORT) {
+        if ((byte_num = read(sockfd, buffer, MAXSIZE)) <= 0) {
+            printf("[x] Connection establish failed.\n");
+        }
+
+        if (write(clifd, buffer, byte_num) < 0) {
+            printf("[x] Write to client failed.\n");
+            return -1;
+        }
+    }
+
+    return sockfd;
+}
+
+int proxy_func(int ser_port, int clifd, int rate, bool download) {
+    char buffer[MAXSIZE];
+    int serfd = -1, datafd = -1, connfd;
+    int data_port;
+    int byte_num;
+    int status, pasv[7];
+    int childpid;
+    int size, old_size, new_size;
+    socklen_t clilen;
+    struct sockaddr_in cliaddr;
+    // uplaod start time
+    clock_t t1=0, t2=0, t;     
+    
+
+    // select vars
+    int maxfdp1;
+    int i, nready = 0;
+    fd_set rset, allset;
+
+    
+    
+
+    // connect to FTP server
+	// serfd紀錄由socket()產生的sockfd
+	// servaddr指定server的ip port後傳入
+	// sockfd由socket()產生
+    
+    if ((serfd = connect_FTP(ser_port, clifd)) < 0) {
+        printf("[x] Connect to FTP server failed.\n");
+        return -1;
+    }
+
+    datafd = serfd;
+
+    // initialize select vars
+    FD_ZERO(&allset);
+    FD_SET(clifd, &allset);
+    FD_SET(serfd, &allset);
+
+    // selecting
+    for (;;) {
+        // reset select vars
+        rset = allset;
+        maxfdp1 = max(clifd, serfd) + 1;
+
+        // select descriptor
+        nready = select(maxfdp1 + 1, &rset, NULL, NULL, NULL);
+        if (nready > 0) {
+            // check FTP client socket fd
+            if (FD_ISSET(clifd, &rset)) {
+                memset(buffer,'\0', MAXSIZE);
+                if ((byte_num = read(clifd, buffer, MAXSIZE)) <= 0) {
+                    printf("[!] Client terminated the connection.\n");
+                    break;
+                }
+                if(size==0){
+                  size = strlen(buffer)*sizeof(char);
+                  old_size = size;
+                }
+                else
+                old_size = size;
+                size = strlen(buffer)*sizeof(char);
+                t2 = t1;
+                t1 = clock();
+                t = t1-t2;
+
+                rate_control(t, rate, old_size, MagicNumber);
+
+                if (write(serfd, buffer, byte_num) < 0) {
+                    printf("[x] Write to server failed.\n");
+                    break;
+                }
+            }
+            // check FTP server socket fd
+            if (FD_ISSET(serfd, &rset)) {
+                memset(buffer, '\0', MAXSIZE);
+                if ((byte_num = read(serfd, buffer, MAXSIZE)) <= 0) {
+                    printf("[!] Server terminated the connection.\n");
+                    break;
+                }
+
+                if(ser_port == FTP_PORT)
+                  buffer[byte_num] = '\0';
+
+                status = atoi(buffer);               
+                if (status == FTP_PASV_CODE && ser_port == FTP_PORT) {
+
+                    sscanf(buffer, "%d Entering Passive Mode (%d,%d,%d,%d,%d,%d)",&pasv[0],&pasv[1],&pasv[2],&pasv[3],&pasv[4],&pasv[5],&pasv[6]);
+                    memset(buffer, '\0', MAXSIZE);
+                    sprintf(buffer, "%d Entering Passive Mode (%d,%d,%d,%d,%d,%d)\n", status, proxy_IP[0], proxy_IP[1], proxy_IP[2], proxy_IP[3], pasv[5], pasv[6]);
+                    
+                    if ((childpid = fork()) == 0) {
+                        data_port = pasv[5] * 256 + pasv[6];
+                        datafd = create_server(data_port);
+                        printf("[-] Waiting for data connection!\n");
+                        clilen = sizeof(struct sockaddr_in);
+                        connfd = accept(datafd, (struct sockaddr *)&cliaddr, &clilen);
+                        if (connfd < 0) {
+                            printf("[x] Accept failed\n");
+                            return 0;
+                        }
+
+                        printf("[v] Data connection from: %s:%d connect.\n", inet_ntoa(cliaddr.sin_addr), htons(cliaddr.sin_port));
+                        proxy_func(data_port, connfd, rate, true);
+                        printf("[!] End of data connection!\n");
+                        exit(0);
+                    }
+                }
+
+                if(download){
+                  old_size = size;
+                  size = strlen(buffer)*sizeof(char);
+                  t2 = t1;
+                  t1 = clock();
+                  
+                  t = t1-t2;
+                  rate_control(t, rate, old_size, MagicNumber);
+                }
+
+                if (write(clifd, buffer, byte_num) < 0) {
+                    printf("[x] Write to client failed.\n");
+                    break;
+                }
+
+            }
+        } else {
+            printf("[x] Select() returns -1. ERROR!\n");
+            return -1;
+        }
+    }
+    return 0;
+}
+
+int create_server(int port) {
+    int listenfd;
+    struct sockaddr_in servaddr;
+
+    listenfd = socket(AF_INET, SOCK_STREAM, 0);
+    bzero(&servaddr, sizeof(servaddr));
+    servaddr.sin_family = AF_INET;
+    servaddr.sin_addr.s_addr = htonl(INADDR_ANY);
+    servaddr.sin_port = htons(port);
+    if (bind(listenfd, (struct sockaddr *)&servaddr , sizeof(servaddr)) < 0) {
+        
+        perror("bind failed. Error");
+        return -1;
+    }
+
+    listen(listenfd, 3);
+    return listenfd;
+}
+
+void rate_control(clock_t t, int rate, int size, double magic) {
+    long desire_time, t_delay;
+ 
+    desire_time = magic*((long)(size*1000000.0)/(rate*1024.0));    // 10^(-6) sec 
+
+    if(t < desire_time){   
+		t_delay = (int)(desire_time-t);
+       
+		usleep(t_delay);
+    }
+}
